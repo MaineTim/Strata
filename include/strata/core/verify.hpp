@@ -563,6 +563,9 @@ private:
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
+    // #2500 (option A), STRATA_SPIN_REPORT=1: report + clear the spin-expiry markers (word 2 of each window
+    // flag block); answer_ms < 0: no answer time to name (the check after the window's final sync)
+    void report_spin_expiry(int64_t layer, double answer_ms);
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;

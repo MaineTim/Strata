@@ -3,6 +3,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_doorbell.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -346,6 +347,31 @@ void Verifier::trace_ev(const char* what, int64_t step, int64_t layer, int64_t a
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
     TraceEv& e = g_trace_ring[g_trace_next.fetch_add(1) % kTraceN];
     e = {trace_now_ns(), this, windows, step, layer, aux, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), what};
+}
+
+// #2500 (option A, STRATA_SPIN_REPORT=1): a device spin that ran to its bound (the wait's flag never arrived
+// while the host's answer for the layer was still in flight) leaves 1 in word 2 of the flag's mapped block
+// (wait_flag_ge and wait_flag_ge_or in sycl/src/kernels/cuda/verify_kernels.dp.cpp). The verify loop reads the
+// three markers once per layer it already serves and once after the window's final sync (a wait that ran to its
+// bound after the last answer - the stall test). One line per expired wait: the window, the layer, the wait,
+// how long the host answer took - a crossed bound used to corrupt the window silently (the miss payload merges
+// as zeros). The marker is cleared as it is read; the window's staging (stage_inputs / stage_batch) zeroes it.
+void Verifier::report_spin_expiry(int64_t layer, double answer_ms) {
+    if (!strata::spin_report_on() || h_flag_ == nullptr) return;
+    const struct { const char* what; uint32_t* flag; } waits[3] = {
+        {"the served wait", h_flag_}, {"the plan (A) wait", h_flagA_}, {"the copies (B) wait", h_flagB_}};
+    for (const auto& w : waits) {
+        if (w.flag == nullptr || *(const volatile uint32_t*) (w.flag + 2) == 0) continue;
+        *(volatile uint32_t*) (w.flag + 2) = 0;
+        std::string line = "strata: window " + std::to_string(windows + 1) + " expired at layer " + std::to_string(layer)
+                           + " (" + w.what + " ran to its bound of " + std::to_string(strata::spin_max(*strata::q_of(cs_)))
+                           + " reads"
+                           + (answer_ms >= 0.0 ? std::string(", the host answer took ") + std::to_string((long long) answer_ms) + " ms"
+                                               : std::string())
+                           + ") - the window's tokens from this layer on were emitted without the host's experts (#2500)";
+        std::fprintf(stderr, "%s\n", line.c_str());
+        std::fflush(stderr);
+    }
 }
 
 void Verifier::trace_dump(std::FILE* f) const {
@@ -1962,6 +1988,11 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (strata::spin_report_on()) {   // #2500 (A): this window's spin-expiry markers (word 2 of each flag block)
+        ((volatile uint32_t*) h_flag_)[2] = 0;
+        ((volatile uint32_t*) h_flagA_)[2] = 0;
+        ((volatile uint32_t*) h_flagB_)[2] = 0;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -2158,6 +2189,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             st_wait += std::chrono::duration<double, std::milli>(b - a).count();
             st_pool += ms_since(b);
+            report_spin_expiry(l, ms_since(b));   // #2500 (A): a wait that ran to its bound while this layer was served
             return true;
         };
         try {
@@ -2322,6 +2354,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         if (!(test_stall && k + 1 == steps)) *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        report_spin_expiry(l, ms_since(b));   // #2500 (A): a wait that ran to its bound while this layer was served
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
@@ -2331,6 +2364,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNC", -1, -1, 0);
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
     trace_ev("SYNCED", -1, -1, (int64_t) se);
+    report_spin_expiry(le_ - 1, -1);   // #2500 (A): a wait that ran to its bound after the last answer (the stall test)
     const Clock::time_point t_done = Clock::now();
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
         std::fprintf(stderr, "verify dbg: T=%d window: since previous window %.1f ms, staging %.1f ms, gpu %.1f ms\n", T,
@@ -3104,6 +3138,11 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (strata::spin_report_on()) {   // #2500 (A): this window's spin-expiry markers (word 2 of each flag block)
+        ((volatile uint32_t*) h_flag_)[2] = 0;
+        ((volatile uint32_t*) h_flagA_)[2] = 0;
+        ((volatile uint32_t*) h_flagB_)[2] = 0;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
@@ -3186,6 +3225,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         }
         copy_->wait();
         if (prof_on_) collect_profile();
+        report_spin_expiry(le_ - 1, -1);   // #2500 (A)
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
         if (!sample_rows(S, err)) return false;
@@ -3250,6 +3290,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        report_spin_expiry(l, ms_since(b));   // #2500 (A): a wait that ran to its bound while this layer was served
     }
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
     /*
@@ -3269,6 +3310,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     }
     copy_->wait();
     if (prof_on_) collect_profile();
+    report_spin_expiry(le_ - 1, -1);   // #2500 (A)
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
     if (!sample_rows(S, err)) return false;
@@ -3494,6 +3536,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
             raise_flag(h_flagB_, want);
         }
         *(volatile uint32_t*) h_flag_ = want;
+        report_spin_expiry(lb_ + b_k_, ms_since(b));   // #2500 (A): a wait that ran to its bound while this layer was served
         ms_pool += ms_since(b);
         b_last_ = Clock::now();
         ++b_k_;
@@ -3534,6 +3577,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
     to rewrite this code.
     */
     if (qc == 1) return 0;
+    report_spin_expiry(le_ - 1, -1);   // #2500 (A)
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -3827,6 +3871,7 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
+        report_spin_expiry(l, ms_since(b));   // #2500 (A): a wait that ran to its bound while this layer was served
         ++fl_k_;
         ms_pool += ms_since(b);
         fl_since_ms_ = fl_flush_ms_ = now_ms();
@@ -3877,6 +3922,7 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
+    report_spin_expiry(le_ - 1, -1);   // #2500 (A): a wait that ran to its bound after the last answer
     if (fl_prof_) accumulate_profile(prof_pin_);
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));

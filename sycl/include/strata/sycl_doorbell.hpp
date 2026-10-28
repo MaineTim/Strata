@@ -151,4 +151,21 @@ inline uint32_t spin_max(const sycl::queue& q) {
     cache.emplace(d, v);
     return v;
 }
+// #2500 (option A): STRATA_SPIN_REPORT=1. When a bounded device spin runs to its bound (the flag it waits for
+// never arrived while the host's answer for the layer was in flight), the spin kernel stores 1 into WORD 2 of
+// the flag's mapped block (the window's flag blocks are 64 mapped bytes; the host verify loop reads and clears
+// the word after each layer and after the window's final sync, and logs one line per expired wait with the
+// window, the layer, and how long the host answer took). Word 2, not word 1: raise_flag's Windows variant is a
+// 64-bit compare-and-exchange and writes words 0-1 of the flag it raises. Without the report a crossed bound is
+// invisible: the window goes on with the host-served outputs missing (the miss payload merges as zeros) and the
+// failure only shows up as a single-token repeat far downstream. Off: nothing is stored, nothing is read, the
+// default path is unchanged. The spin kernels of the doorbell handshake (doorbell_wait) are not marked: their
+// flag block is a single word and the session decode path is not the window's ratchet class.
+inline bool spin_report_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SPIN_REPORT");
+        return v != nullptr && v[0] != '0' && v[0] != '\0';
+    }();
+    return on;
+}
 }  // namespace strata
